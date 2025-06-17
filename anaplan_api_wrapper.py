@@ -4,8 +4,10 @@ import time
 import os
 from base64 import b64encode
 from typing import Optional, Dict, Any, List
-
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 import logging
+
 logging.basicConfig(
     format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
     datefmt='%H:%M:%S',
@@ -28,57 +30,80 @@ class AnaplanAPI:
         self.base_url = base_url
         self.token = None
         self.headers = None
+        self.session = self._create_session()
 
-    def authenticate(self) -> bool:
+    def _create_session(self) -> requests.Session:
+        """
+        Create a requests session with retry configuration.
+        
+        Returns:
+            requests.Session: Configured session with retry logic
+        """
+        session = requests.Session()
+        retries = Retry(
+            total=60,
+            backoff_factor=0.5,
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["POST", "GET", "PUT"],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        session.mount("https://", adapter)
+        return session
+
+    def authenticate(self) -> None:
         """
         Authenticate with Anaplan API using base64-encoded email and password.
         
-        Returns:
-            bool: True if authentication successful, False otherwise
+        Raises:
+            requests.RequestException: If authentication fails
         """
         auth_str = b64encode(f"{self.email}:{self.password}".encode()).decode()
         headers = {"Authorization": f"Basic {auth_str}"}
-        url = f"https://auth.anaplan.com/token/authenticate"
+        url = "https://auth.anaplan.com/token/authenticate"
         
         try:
-            response = requests.post(url, headers=headers)
+            response = self.session.post(url, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
             
-            if data.get("status") == "SUCCESS":
-                self.token = data["tokenInfo"]["tokenValue"]
-                self.headers = {
-                    "Authorization": f"AnaplanAuthToken {self.token}",
-                    "Content-Type": "application/json"
-                }
-                return True
-            return False
+            if data.get("status") != "SUCCESS":
+                raise requests.RequestException("Invalid credentials")
+            self.token = data["tokenInfo"]["tokenValue"]
+            self.headers = {
+                "Authorization": f"AnaplanAuthToken {self.token}",
+                "Content-Type": "application/json"
+            }
+            logger.info("Authentication successful")
             
         except requests.RequestException as e:
             logger.error(f"Authentication failed: {e}")
-            return False
+            raise
 
-    def get_workspaces(self) -> Optional[Dict[str, Any]]:
+    def get_workspaces(self) -> Dict[str, Any]:
         """
         Retrieve available workspaces.
         
         Returns:
-            Optional[Dict[str, Any]]: Workspace data or None if request fails
+            Dict[str, Any]: Workspace data
+            
+        Raises:
+            requests.RequestException: If request fails
         """
         if not self.headers:
-            if not self.authenticate():
-                return None
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
+            logger.info("Workspaces retrieved successfully")
             return response.json()
         except requests.RequestException as e:
             logger.error(f"Failed to get workspaces: {e}")
-            return None
+            raise
 
-    def list_files(self, workspace_id: str, model_id: str) -> Optional[List[Dict[str, Any]]]:
+    def list_files(self, workspace_id: str, model_id: str) -> List[Dict[str, Any]]:
         """
         List files in a specific workspace and model.
         
@@ -87,23 +112,25 @@ class AnaplanAPI:
             model_id (str): Model ID
             
         Returns:
-            Optional[List[Dict[str, Any]]]: List of file metadata or None if request fails
+            List[Dict[str, Any]]: List of file metadata
+            
+        Raises:
+            requests.RequestException: If request fails
         """
         if not self.headers:
-            if not self.authenticate():
-                return None
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
-            data = response.json()
-            return data.get("files", [])
+            logger.info(f"Files listed for workspace {workspace_id}, model {model_id}")
+            return response.json().get("files", [])
         except requests.RequestException as e:
             logger.error(f"Failed to list files: {e}")
-            return None
+            raise
 
-    def list_processes(self, workspace_id: str, model_id: str) -> Optional[List[Dict[str, Any]]]:
+    def list_processes(self, workspace_id: str, model_id: str) -> List[Dict[str, Any]]:
         """
         List processes in a specific workspace and model.
         
@@ -112,23 +139,25 @@ class AnaplanAPI:
             model_id (str): Model ID
             
         Returns:
-            Optional[List[Dict[str, Any]]]: List of process metadata or None if request fails
+            List[Dict[str, Any]]: List of process metadata
+            
+        Raises:
+            requests.RequestException: If request fails
         """
         if not self.headers:
-            if not self.authenticate():
-                return None
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/processes"
         try:
-            response = requests.get(url, headers=self.headers)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
-            data = response.json()
-            return data.get("processes", [])
+            logger.info(f"Processes listed for workspace {workspace_id}, model {model_id}")
+            return response.json().get("processes", [])
         except requests.RequestException as e:
             logger.error(f"Failed to list processes: {e}")
-            return None
+            raise
 
-    def get_file_id(self, workspace_id: str, model_id: str, file_name: str) -> Optional[str]:
+    def get_file_id(self, workspace_id: str, model_id: str, file_name: str) -> str:
         """
         Get file ID by file name.
         
@@ -138,16 +167,21 @@ class AnaplanAPI:
             file_name (str): Name of the file to find
             
         Returns:
-            Optional[str]: File ID if found, None otherwise
+            str: File ID
+            
+        Raises:
+            ValueError: If file not found
+            requests.RequestException: If request fails
         """
         files = self.list_files(workspace_id, model_id)
-        if files:
-            for file in files:
-                if file.get("name") == file_name:
-                    return file.get("id")
-        return None
+        for file in files:
+            if file.get("name") == file_name:
+                logger.info(f"Found file ID {file.get('id')} for file {file_name}")
+                return file.get("id")
+        logger.error(f"File {file_name} not found in workspace {workspace_id}, model {model_id}")
+        raise ValueError(f"File {file_name} not found")
 
-    def get_process_id(self, workspace_id: str, model_id: str, process_name: str) -> Optional[str]:
+    def get_process_id(self, workspace_id: str, model_id: str, process_name: str) -> str:
         """
         Get process ID by process name.
         
@@ -157,17 +191,22 @@ class AnaplanAPI:
             process_name (str): Name of the process to find
             
         Returns:
-            Optional[str]: Process ID if found, None otherwise
+            str: Process ID
+            
+        Raises:
+            ValueError: If process not found
+            requests.RequestException: If request fails
         """
         processes = self.list_processes(workspace_id, model_id)
-        if processes:
-            for process in processes:
-                if process.get("name") == process_name:
-                    return process.get("id")
-        return None
+        for process in processes:
+            if process.get("name") == process_name:
+                logger.info(f"Found process ID {process.get('id')} for process {process_name}")
+                return process.get("id")
+        logger.error(f"Process {process_name} not found in workspace {workspace_id}, model {model_id}")
+        raise ValueError(f"Process {process_name} not found")
 
     def upload_file_chunk(self, workspace_id: str, model_id: str, file_id: str, chunk_number: int, 
-                         chunk_data: bytes) -> bool:
+                         chunk_data: bytes) -> None:
         """
         Upload a single chunk of a file.
         
@@ -178,27 +217,26 @@ class AnaplanAPI:
             chunk_number (int): Chunk number (0-based index)
             chunk_data (bytes): Chunk data to upload
             
-        Returns:
-            bool: True if chunk upload successful, False otherwise
+        Raises:
+            requests.RequestException: If chunk upload fails
         """
         if not self.headers:
-            if not self.authenticate():
-                return False
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{file_id}/chunks/{chunk_number}"
         chunk_headers = self.headers.copy()
         chunk_headers["Content-Type"] = "application/octet-stream"
         
         try:
-            response = requests.put(url, headers=chunk_headers, data=chunk_data)
+            response = self.session.put(url, headers=chunk_headers, data=chunk_data, timeout=10)
             response.raise_for_status()
-            logger.info(response)
-            return True
+            logger.info(f"Uploaded chunk {chunk_number} for file ID {file_id}")
         except requests.RequestException as e:
             logger.error(f"Failed to upload chunk {chunk_number}: {e}")
-            return False
+            raise
 
-    def upload_file(self, workspace_id: str, model_id: str, file_path: str, file_name: str, chunk_size: int = 10485760) -> Optional[Dict[str, Any]]:
+    def upload_file(self, workspace_id: str, model_id: str, file_path: str, file_name: str, 
+                    chunk_size: int = 10485760) -> str:
         """
         Upload a file to Anaplan in chunks.
         
@@ -206,61 +244,57 @@ class AnaplanAPI:
             workspace_id (str): Workspace ID
             model_id (str): Model ID
             file_path (str): Local path to the file to upload
+            file_name (str): Name of the file in Anaplan
             chunk_size (int): Size of each chunk in bytes (default: 10MB)
             
         Returns:
-            Optional[Dict[str, Any]]: File upload result or None if upload fails
+            str: File ID of the uploaded file
+            
+        Raises:
+            requests.RequestException: If upload fails
+            FileNotFoundError: If file_path is invalid
         """
         if not self.headers:
-            if not self.authenticate():
-                return None
+            self.authenticate()
                 
-        # Get file name and size
+        if not os.path.exists(file_path):
+            logger.error(f"File {file_path} does not exist")
+            raise FileNotFoundError(f"File {file_path} does not exist")
+            
         file_size = os.path.getsize(file_path)
-        _file_id = self.get_file_id(workspace_id, model_id, file_name)
-        # Calculate chunk count
         chunk_count = (file_size + chunk_size - 1) // chunk_size
         
-        # Initiate file upload
-        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{_file_id}"
-        payload = {"chunkCount": chunk_count}
+        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files"
+        payload = {"name": file_name, "chunkCount": chunk_count}
         try:
-            response = requests.post(url, headers=self.headers, json=payload)
+            response = self.session.post(url, headers=self.headers, json=payload, timeout=10)
             response.raise_for_status()
-            logger.info(response.json())
-            file_id = response.json().get("file").get("id")
+            file_id = response.json().get("id")
             if not file_id:
                 logger.error("Failed to initiate file upload: No file ID returned")
-                return None
+                raise requests.RequestException("No file ID returned")
+            logger.info(f"Initiated file upload for {file_name}, file ID: {file_id}")
         except requests.RequestException as e:
             logger.error(f"Failed to initiate file upload: {e}")
-            return None
+            raise
             
-        # Read and upload file in chunks
         with open(file_path, "rb") as f:
             for chunk_number in range(chunk_count):
                 chunk_data = f.read(chunk_size)
-                if not self.upload_file_chunk(workspace_id, model_id, file_id, chunk_number, chunk_data):
-                    logger.error(f"Upload aborted at chunk {chunk_number}")
-                    return None
+                self.upload_file_chunk(workspace_id, model_id, file_id, chunk_number, chunk_data)
                 
-        # Complete file upload
         complete_url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{file_id}/complete"
         complete_payload = {"chunkCount": chunk_count}
         try:
-            response = requests.post(complete_url, headers=self.headers, json=complete_payload)
+            response = self.session.post(complete_url, headers=self.headers, json=complete_payload, timeout=10)
             response.raise_for_status()
-            return {
-                "file_id": file_id,
-                "file_name": file_name,
-                "chunk_count": chunk_count,
-                "status": "COMPLETED"
-            }
+            logger.info(f"Completed file upload for {file_name}, file ID: {file_id}")
+            return file_id
         except requests.RequestException as e:
             logger.error(f"Failed to complete file upload: {e}")
-            return None
+            raise
 
-    def trigger_process(self, workspace_id: str, model_id: str, process_id: str, locale_name: str = "en_US") -> Optional[str]:
+    def trigger_process(self, workspace_id: str, model_id: str, process_id: str, locale_name: str = "en_US") -> str:
         """
         Trigger an Anaplan process and return the task ID.
         
@@ -271,25 +305,29 @@ class AnaplanAPI:
             locale_name (str): Locale for the process (default: en_US)
             
         Returns:
-            Optional[str]: Task ID if successful, None otherwise
+            str: Task ID
+            
+        Raises:
+            requests.RequestException: If process trigger fails
         """
         if not self.headers:
-            if not self.authenticate():
-                return None
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/processes/{process_id}/tasks"
         payload = {"localeName": locale_name}
         try:
-            response = requests.post(url, headers=self.headers, json=payload)
+            response = self.session.post(url, headers=self.headers, json=payload, timeout=10)
             response.raise_for_status()
             data = response.json()
-            if data.get("status").get("message") == "Success":
-                return data["task"]["taskId"]
-            return None
-            
+            if data.get("status", {}).get("message") != "Success":
+                logger.error(f"Failed to trigger process: {data.get('status', {}).get('message', 'Unknown error')}")
+                raise requests.RequestException(data.get("status", {}).get("message", "Unknown error"))
+            task_id = data["task"]["taskId"]
+            logger.info(f"Triggered process {process_id}, task ID: {task_id}")
+            return task_id
         except requests.RequestException as e:
             logger.error(f"Failed to trigger process: {e}")
-            return None
+            raise
 
     def monitor_task(self, workspace_id: str, model_id: str, process_id: str, task_id: str, 
                     poll_interval: int = 5, max_attempts: int = 240) -> Dict[str, Any]:
@@ -306,38 +344,40 @@ class AnaplanAPI:
             
         Returns:
             Dict[str, Any]: Task status information
+            
+        Raises:
+            requests.RequestException: If task monitoring fails
+            TimeoutError: If task monitoring times out
         """
         if not self.headers:
-            if not self.authenticate():
-                return {"status": "FAILED", "message": "Authentication failed"}
+            self.authenticate()
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/processes/{process_id}/tasks/{task_id}"
         
         for attempt in range(max_attempts):
             try:
-                response = requests.get(url, headers=self.headers)
+                response = self.session.get(url, headers=self.headers, timeout=10)
                 response.raise_for_status()
                 data = response.json()
-                logger.info(data)
                 task_state = data["task"]["taskState"]
+                logger.info(f"Task {task_id} status: {task_state}")
                 if task_state in ["COMPLETE", "FAILED", "CANCELLED"]:
                     return {
                         "status": task_state,
                         "details": data["task"].get("result", {}),
-                        "message": data["task"].get("currentStep", "Task Completed Success")
+                        "message": data["task"].get("currentStep", "Task Completed Successfully")
                     }
-                    
                 time.sleep(poll_interval)
-
             except requests.RequestException as e:
                 logger.error(f"Failed to check task status: {e}")
-                return {"status": "ERROR", "message": str(e)}
+                raise
                 
-        return {"status": "TIMEOUT", "message": "Task monitoring timed out"}
+        logger.error("Task monitoring timed out")
+        raise TimeoutError("Task monitoring timed out")
 
     def execute_sequence(self, workspace_id: str, model_id: str, process_wake_up: str, 
                         file_path: str, file_name: str, process_name: str, chunk_size: int = 10485760,
-                        locale_name: str = "en_US") -> Dict[str, Any]:
+                        locale_name: str = "en_US") -> None:
         """
         Execute a sequence of operations: wake-up process, file upload, and main process.
         
@@ -346,77 +386,64 @@ class AnaplanAPI:
             model_id (str): Model ID
             process_wake_up (str): Name of the wake-up process to run first
             file_path (str): Local path to the file to upload
+            file_name (str): Name of the file in Anaplan
             process_name (str): Name of the main process to trigger
-            chunk_size (int): Size of each chunk in bytes for file upload (default: 10MB)
-            delimiter (str): File delimiter (default: comma)
-            encoding (str): File encoding (default: UTF-8)
+            chunk_size (int): Size of each chunk in bytes (default: 10MB)
             locale_name (str): Locale for processes (default: en_US)
             
-        Returns:
-            Dict[str, Any]: Result of the sequence execution
+        Raises:
+            ValueError: If process or file not found
+            requests.RequestException: If any API call fails
+            FileNotFoundError: If file_path is invalid
+            TimeoutError: If task monitoring times out
         """
-        result = {"steps": {}, "success": True, "message": ""}
+        try:
+            wake_up_id = self.get_process_id(workspace_id, model_id, process_wake_up)
+            wake_up_task_id = self.trigger_process(workspace_id, model_id, wake_up_id, locale_name)
+            wake_up_result = self.monitor_task(workspace_id, model_id, wake_up_id, wake_up_task_id)
+            if wake_up_result["status"] != "COMPLETE":
+                logger.error(f"Wake-up process failed: {wake_up_result['message']}")
+                raise requests.RequestException(f"Wake-up process failed: {wake_up_result['message']}")
 
-        wake_up_id = self.get_process_id(workspace_id, model_id, process_wake_up)
-        if not wake_up_id:
-            result["steps"]["wake_up"] = {"status": "FAILED", "message": f"Wake-up process '{process_wake_up}' not found"}
-            result["success"] = False
-            return result
+            file_id = self.upload_file(workspace_id, model_id, file_path, file_name, chunk_size)
 
-        wake_up_task_id = self.trigger_process(workspace_id, model_id, wake_up_id, locale_name)
-        if not wake_up_task_id:
-            result["steps"]["wake_up"] = {"status": "FAILED", "message": "Failed to trigger wake-up process"}
-            result["success"] = False
-            return result
+            process_id = self.get_process_id(workspace_id, model_id, process_name)
+            task_id = self.trigger_process(workspace_id, model_id, process_id, locale_name)
+            main_process_result = self.monitor_task(workspace_id, model_id, process_id, task_id)
+            if main_process_result["status"] != "COMPLETE":
+                logger.error(f"Main process failed: {main_process_result['message']}")
+                raise requests.RequestException(f"Main process failed: {main_process_result['message']}")
 
-        wake_up_result = self.monitor_task(workspace_id, model_id, wake_up_id, wake_up_task_id)
-        result["steps"]["wake_up"] = wake_up_result
-        if wake_up_result["status"] != "COMPLETE":
-            result["success"] = False
-            result["message"] = f"Wake-up process failed: {wake_up_result['message']}"
-            return result
-
-        upload_result = self.upload_file(workspace_id, model_id, file_path, file_name ,chunk_size)
-        if not upload_result:
-            result["steps"]["file_upload"] = {"status": "FAILED", "message": f"Failed to upload file '{file_name}'"}
-            result["success"] = False
-            return result
-        result["steps"]["file_upload"] = upload_result
-
-        process_id = self.get_process_id(workspace_id, model_id, process_name)
-        if not process_id:
-            result["steps"]["main_process"] = {"status": "FAILED", "message": f"Main process '{process_name}' not found"}
-            result["success"] = False
-            return result
+            logger.info("Sequence executed successfully")
             
-        task_id = self.trigger_process(workspace_id, model_id, process_id, locale_name)
-        if not task_id:
-            result["steps"]["main_process"] = {"status": "FAILED", "message": "Failed to trigger main process"}
-            result["success"] = False
-            return result
-            
-        main_process_result = self.monitor_task(workspace_id, model_id, process_id, task_id)
-        result["steps"]["main_process"] = main_process_result
-        if main_process_result["status"] != "COMPLETE":
-            result["success"] = False
-            result["message"] = f"Main process failed: {main_process_result['message']}"
-            return result
-        
-        return result
+        except (ValueError, requests.RequestException, FileNotFoundError, TimeoutError) as e:
+            logger.error(f"Sequence execution failed: {e}")
+            raise
 
 def main():
-    email = "your.email@example.com"
-    password = "your_password"
-    workspace_id = "YOUR_WORKSPACE_ID"
-    model_id = "YOUR_MODEL_ID"
-    process_wake_up = "YOUR_WAKE_UP_PROCESS_NAME"
-    file_path = "path/to/your/file.csv"
-    file_name = "file.csv"
-    process_name = "YOUR_MAIN_PROCESS_NAME"
-    
-    # Initialize API wrapper
-    anaplan = AnaplanAPI(email, password)
-    anaplan.execute_sequence(workspace_id, model_id, process_wake_up, file_path, file_name, process_name)
+    try:
+        email = "your.email@example.com"
+        password = "your_password"
+        workspace_id = "YOUR_WORKSPACE_ID"
+        model_id = "YOUR_MODEL_ID"
+        process_wake_up = "YOUR_WAKE_UP_PROCESS_NAME"
+        file_path = "path/to/your/file.csv"
+        file_name = "file.csv"
+        process_name = "YOUR_MAIN_PROCESS_NAME"
+        
+        anaplan = AnaplanAPI(email, password)
+        anaplan.execute_sequence(
+            workspace_id,
+            model_id,
+            process_wake_up,
+            file_path,
+            file_name,
+            process_name,
+            locale_name="en_US"
+        )
+    except Exception as e:
+        logger.error(f"Main execution failed: {e}")
+        raise
 
 if __name__ == "__main__":
     main()
