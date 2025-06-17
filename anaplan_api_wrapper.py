@@ -2,8 +2,16 @@ import requests
 import json
 import time
 import os
-import base64
+from base64 import b64encode
 from typing import Optional, Dict, Any, List
+
+import logging
+logging.basicConfig(
+    format='%(asctime)s,%(msecs)d %(name)s %(levelname)s %(message)s',
+    datefmt='%H:%M:%S',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
 class AnaplanAPI:
     def __init__(self, email: str, password: str, base_url: str = "https://api.anaplan.com/2/0"):
@@ -28,14 +36,12 @@ class AnaplanAPI:
         Returns:
             bool: True if authentication successful, False otherwise
         """
-        url = "https://auth.anaplan.com/token/authenticate"
-        # Encode credentials as username:password in base64
-        credentials = f"{self.email}:{self.password}".encode("utf-8")
-        encoded_credentials = base64.b64encode(credentials).decode("utf-8")
-        payload = {"credentials": encoded_credentials}
+        auth_str = b64encode(f"{self.email}:{self.password}".encode()).decode()
+        headers = {"Authorization": f"Basic {auth_str}"}
+        url = f"https://auth.anaplan.com/token/authenticate"
         
         try:
-            response = requests.post(url, json=payload)
+            response = requests.post(url, headers=headers)
             response.raise_for_status()
             data = response.json()
             
@@ -49,7 +55,7 @@ class AnaplanAPI:
             return False
             
         except requests.RequestException as e:
-            print(f"Authentication failed: {e}")
+            logger.error(f"Authentication failed: {e}")
             return False
 
     def get_workspaces(self) -> Optional[Dict[str, Any]]:
@@ -69,7 +75,7 @@ class AnaplanAPI:
             response.raise_for_status()
             return response.json()
         except requests.RequestException as e:
-            print(f"Failed to get workspaces: {e}")
+            logger.error(f"Failed to get workspaces: {e}")
             return None
 
     def list_files(self, workspace_id: str, model_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -94,7 +100,7 @@ class AnaplanAPI:
             data = response.json()
             return data.get("files", [])
         except requests.RequestException as e:
-            print(f"Failed to list files: {e}")
+            logger.error(f"Failed to list files: {e}")
             return None
 
     def list_processes(self, workspace_id: str, model_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -119,7 +125,7 @@ class AnaplanAPI:
             data = response.json()
             return data.get("processes", [])
         except requests.RequestException as e:
-            print(f"Failed to list processes: {e}")
+            logger.error(f"Failed to list processes: {e}")
             return None
 
     def get_file_id(self, workspace_id: str, model_id: str, file_name: str) -> Optional[str]:
@@ -186,13 +192,13 @@ class AnaplanAPI:
         try:
             response = requests.put(url, headers=chunk_headers, data=chunk_data)
             response.raise_for_status()
+            logger.info(response)
             return True
         except requests.RequestException as e:
-            print(f"Failed to upload chunk {chunk_number}: {e}")
+            logger.error(f"Failed to upload chunk {chunk_number}: {e}")
             return False
 
-    def upload_file(self, workspace_id: str, model_id: str, file_path: str, 
-                    chunk_size: int = 10485760, delimiter: str = ",", encoding: str = "UTF-8") -> Optional[Dict[str, Any]]:
+    def upload_file(self, workspace_id: str, model_id: str, file_path: str, file_name: str, chunk_size: int = 10485760) -> Optional[Dict[str, Any]]:
         """
         Upload a file to Anaplan in chunks.
         
@@ -201,8 +207,6 @@ class AnaplanAPI:
             model_id (str): Model ID
             file_path (str): Local path to the file to upload
             chunk_size (int): Size of each chunk in bytes (default: 10MB)
-            delimiter (str): File delimiter (default: comma)
-            encoding (str): File encoding (default: UTF-8)
             
         Returns:
             Optional[Dict[str, Any]]: File upload result or None if upload fails
@@ -212,29 +216,24 @@ class AnaplanAPI:
                 return None
                 
         # Get file name and size
-        file_name = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
-        
+        _file_id = self.get_file_id(workspace_id, model_id, file_name)
         # Calculate chunk count
         chunk_count = (file_size + chunk_size - 1) // chunk_size
         
         # Initiate file upload
-        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files"
-        payload = {
-            "name": file_name,
-            "chunkCount": chunk_count,
-            "delimiter": delimiter,
-            "encoding": encoding
-        }
+        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{_file_id}"
+        payload = {"chunkCount": chunk_count}
         try:
             response = requests.post(url, headers=self.headers, json=payload)
             response.raise_for_status()
-            file_id = response.json().get("id")
+            logger.info(response.json())
+            file_id = response.json().get("file").get("id")
             if not file_id:
-                print("Failed to initiate file upload: No file ID returned")
+                logger.error("Failed to initiate file upload: No file ID returned")
                 return None
         except requests.RequestException as e:
-            print(f"Failed to initiate file upload: {e}")
+            logger.error(f"Failed to initiate file upload: {e}")
             return None
             
         # Read and upload file in chunks
@@ -242,7 +241,7 @@ class AnaplanAPI:
             for chunk_number in range(chunk_count):
                 chunk_data = f.read(chunk_size)
                 if not self.upload_file_chunk(workspace_id, model_id, file_id, chunk_number, chunk_data):
-                    print(f"Upload aborted at chunk {chunk_number}")
+                    logger.error(f"Upload aborted at chunk {chunk_number}")
                     return None
                 
         # Complete file upload
@@ -258,7 +257,7 @@ class AnaplanAPI:
                 "status": "COMPLETED"
             }
         except requests.RequestException as e:
-            print(f"Failed to complete file upload: {e}")
+            logger.error(f"Failed to complete file upload: {e}")
             return None
 
     def trigger_process(self, workspace_id: str, model_id: str, process_id: str, locale_name: str = "en_US") -> Optional[str]:
@@ -284,17 +283,16 @@ class AnaplanAPI:
             response = requests.post(url, headers=self.headers, json=payload)
             response.raise_for_status()
             data = response.json()
-            
-            if data.get("status") == "SUCCESS":
+            if data.get("status").get("message") == "Success":
                 return data["task"]["taskId"]
             return None
             
         except requests.RequestException as e:
-            print(f"Failed to trigger process: {e}")
+            logger.error(f"Failed to trigger process: {e}")
             return None
 
     def monitor_task(self, workspace_id: str, model_id: str, process_id: str, task_id: str, 
-                    poll_interval: int = 5, max_attempts: int = 60) -> Dict[str, Any]:
+                    poll_interval: int = 5, max_attempts: int = 240) -> Dict[str, Any]:
         """
         Monitor task status until completion or failure.
         
@@ -320,26 +318,26 @@ class AnaplanAPI:
                 response = requests.get(url, headers=self.headers)
                 response.raise_for_status()
                 data = response.json()
-                
+                logger.info(data)
                 task_state = data["task"]["taskState"]
                 if task_state in ["COMPLETE", "FAILED", "CANCELLED"]:
                     return {
                         "status": task_state,
                         "details": data["task"].get("result", {}),
-                        "message": data["task"].get("statusMessage", "")
+                        "message": data["task"].get("currentStep", "Task Completed Success")
                     }
                     
                 time.sleep(poll_interval)
-                
+
             except requests.RequestException as e:
-                print(f"Failed to check task status: {e}")
+                logger.error(f"Failed to check task status: {e}")
                 return {"status": "ERROR", "message": str(e)}
                 
         return {"status": "TIMEOUT", "message": "Task monitoring timed out"}
 
     def execute_sequence(self, workspace_id: str, model_id: str, process_wake_up: str, 
-                        file_path: str, process_name: str, chunk_size: int = 10485760,
-                        delimiter: str = ",", encoding: str = "UTF-8", locale_name: str = "en_US") -> Dict[str, Any]:
+                        file_path: str, file_name: str, process_name: str, chunk_size: int = 10485760,
+                        locale_name: str = "en_US") -> Dict[str, Any]:
         """
         Execute a sequence of operations: wake-up process, file upload, and main process.
         
@@ -358,37 +356,33 @@ class AnaplanAPI:
             Dict[str, Any]: Result of the sequence execution
         """
         result = {"steps": {}, "success": True, "message": ""}
-        
-        # Step 1: Run wake-up process
+
         wake_up_id = self.get_process_id(workspace_id, model_id, process_wake_up)
         if not wake_up_id:
             result["steps"]["wake_up"] = {"status": "FAILED", "message": f"Wake-up process '{process_wake_up}' not found"}
             result["success"] = False
             return result
-            
+
         wake_up_task_id = self.trigger_process(workspace_id, model_id, wake_up_id, locale_name)
         if not wake_up_task_id:
             result["steps"]["wake_up"] = {"status": "FAILED", "message": "Failed to trigger wake-up process"}
             result["success"] = False
             return result
-            
+
         wake_up_result = self.monitor_task(workspace_id, model_id, wake_up_id, wake_up_task_id)
         result["steps"]["wake_up"] = wake_up_result
         if wake_up_result["status"] != "COMPLETE":
             result["success"] = False
             result["message"] = f"Wake-up process failed: {wake_up_result['message']}"
             return result
-            
-        # Step 2: Upload file
-        file_name = os.path.basename(file_path)
-        upload_result = self.upload_file(workspace_id, model_id, file_path, chunk_size, delimiter, encoding)
+
+        upload_result = self.upload_file(workspace_id, model_id, file_path, file_name ,chunk_size)
         if not upload_result:
             result["steps"]["file_upload"] = {"status": "FAILED", "message": f"Failed to upload file '{file_name}'"}
             result["success"] = False
             return result
         result["steps"]["file_upload"] = upload_result
-        
-        # Step 3: Trigger main process
+
         process_id = self.get_process_id(workspace_id, model_id, process_name)
         if not process_id:
             result["steps"]["main_process"] = {"status": "FAILED", "message": f"Main process '{process_name}' not found"}
@@ -411,48 +405,18 @@ class AnaplanAPI:
         return result
 
 def main():
-    # Example usage
     email = "your.email@example.com"
     password = "your_password"
-    
-    # Initialize API wrapper
-    anaplan = AnaplanAPI(email, password)
-    
-    # Example parameters (replace with actual values)
     workspace_id = "YOUR_WORKSPACE_ID"
     model_id = "YOUR_MODEL_ID"
     process_wake_up = "YOUR_WAKE_UP_PROCESS_NAME"
     file_path = "path/to/your/file.csv"
+    file_name = "file.csv"
     process_name = "YOUR_MAIN_PROCESS_NAME"
     
-    # Execute sequence
-    result = anaplan.execute_sequence(
-        workspace_id,
-        model_id,
-        process_wake_up,
-        file_path,
-        process_name,
-        delimiter=",",
-        encoding="UTF-8",
-        locale_name="en_US"
-    )
-    
-    # Print results
-    print("\n=== Sequence Execution Results ===")
-    print(f"Overall Success: {result['success']}")
-    if result["message"]:
-        print(f"Message: {result['message']}")
-        
-    print("\nStep Details:")
-    for step, details in result["steps"].items():
-        print(f"{step.replace('_', ' ').title()}:")
-        print(f"  Status: {details.get('status', 'N/A')}")
-        if "message" in details:
-            print(f"  Message: {details['message']}")
-        if "file_id" in details:
-            print(f"  File ID: {details['file_id']}")
-        if "chunk_count" in details:
-            print(f"  Chunks Uploaded: {details['chunk_count']}")
+    # Initialize API wrapper
+    anaplan = AnaplanAPI(email, password)
+    anaplan.execute_sequence(workspace_id, model_id, process_wake_up, file_path, file_name, process_name)
 
 if __name__ == "__main__":
     main()
