@@ -1,8 +1,9 @@
 import requests
+import json
 import time
 import os
 from base64 import b64encode
-from typing import Dict, Any, List
+from typing import Optional, Dict, Any, List
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import logging
@@ -33,20 +34,33 @@ class AnaplanAPI:
 
     def _create_session(self) -> requests.Session:
         """
-        Create a requests session with retry configuration.
+        Create a requests session with retry configuration and backoff logging.
         
         Returns:
             requests.Session: Configured session with retry logic
         """
         session = requests.Session()
         retries = Retry(
-            total=250,
+            total=60,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["POST", "GET", "PUT"],
             raise_on_status=False
         )
-        adapter = HTTPAdapter(max_retries=retries)
+
+        class CustomRetry(Retry):
+            def increment(self, *args, **kwargs):
+                logger.info("Retrying request due to failure...")
+                return super().increment(*args, **kwargs)
+
+        custom_retries = CustomRetry(
+            total=retries.total,
+            backoff_factor=retries.backoff_factor,
+            status_forcelist=retries.status_forcelist,
+            allowed_methods=retries.allowed_methods,
+            raise_on_status=retries.raise_on_status
+        )
+        adapter = HTTPAdapter(max_retries=custom_retries)
         session.mount("https://", adapter)
         return session
 
@@ -62,7 +76,7 @@ class AnaplanAPI:
         url = "https://auth.anaplan.com/token/authenticate"
         
         try:
-            response = self.session.post(url, headers=headers, timeout=60)
+            response = self.session.post(url, headers=headers, timeout=10)
             response.raise_for_status()
             data = response.json()
             
@@ -94,7 +108,7 @@ class AnaplanAPI:
                 
         url = f"{self.base_url}/workspaces"
         try:
-            response = self.session.get(url, headers=self.headers, timeout=60)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
             logger.info("Workspaces retrieved successfully")
             return response.json()
@@ -121,7 +135,7 @@ class AnaplanAPI:
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files"
         try:
-            response = self.session.get(url, headers=self.headers, timeout=60)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
             logger.info(f"Files listed for workspace {workspace_id}, model {model_id}")
             return response.json().get("files", [])
@@ -148,7 +162,7 @@ class AnaplanAPI:
                 
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/processes"
         try:
-            response = self.session.get(url, headers=self.headers, timeout=60)
+            response = self.session.get(url, headers=self.headers, timeout=10)
             response.raise_for_status()
             logger.info(f"Processes listed for workspace {workspace_id}, model {model_id}")
             return response.json().get("processes", [])
@@ -221,13 +235,13 @@ class AnaplanAPI:
         """
         if not self.headers:
             self.authenticate()
-
+                
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{file_id}/chunks/{chunk_number}"
         chunk_headers = self.headers.copy()
         chunk_headers["Content-Type"] = "application/octet-stream"
-
+        
         try:
-            response = self.session.put(url, headers=chunk_headers, data=chunk_data, timeout=1800)
+            response = self.session.put(url, headers=chunk_headers, data=chunk_data, timeout=10)
             response.raise_for_status()
             logger.info(f"Uploaded chunk {chunk_number} for file ID {file_id}")
         except requests.RequestException as e:
@@ -259,18 +273,16 @@ class AnaplanAPI:
         if not os.path.exists(file_path):
             logger.error(f"File {file_path} does not exist")
             raise FileNotFoundError(f"File {file_path} does not exist")
-        
-        _file_id = self.get_file_id(workspace_id, model_id, file_name)
-        
+            
         file_size = os.path.getsize(file_path)
         chunk_count = (file_size + chunk_size - 1) // chunk_size
         
-        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{_file_id}"
+        url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files"
         payload = {"name": file_name, "chunkCount": chunk_count}
         try:
-            response = self.session.post(url, headers=self.headers, json=payload, timeout=60)
+            response = self.session.post(url, headers=self.headers, json=payload, timeout=10)
             response.raise_for_status()
-            file_id = response.json().get("file").get("id")
+            file_id = response.json().get("id")
             if not file_id:
                 logger.error("Failed to initiate file upload: No file ID returned")
                 raise requests.RequestException("No file ID returned")
@@ -278,16 +290,16 @@ class AnaplanAPI:
         except requests.RequestException as e:
             logger.error(f"Failed to initiate file upload: {e}")
             raise
-
+            
         with open(file_path, "rb") as f:
             for chunk_number in range(chunk_count):
                 chunk_data = f.read(chunk_size)
                 self.upload_file_chunk(workspace_id, model_id, file_id, chunk_number, chunk_data)
-
+                
         complete_url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/files/{file_id}/complete"
         complete_payload = {"chunkCount": chunk_count}
         try:
-            response = self.session.post(complete_url, headers=self.headers, json=complete_payload, timeout=60)
+            response = self.session.post(complete_url, headers=self.headers, json=complete_payload, timeout=10)
             response.raise_for_status()
             logger.info(f"Completed file upload for {file_name}, file ID: {file_id}")
             return file_id
@@ -298,16 +310,16 @@ class AnaplanAPI:
     def trigger_process(self, workspace_id: str, model_id: str, process_id: str, locale_name: str = "en_US") -> str:
         """
         Trigger an Anaplan process and return the task ID.
-
+        
         Args:
             workspace_id (str): Workspace ID
             model_id (str): Model ID
             process_id (str): Process ID to trigger
             locale_name (str): Locale for the process (default: en_US)
-
+            
         Returns:
             str: Task ID
-
+            
         Raises:
             requests.RequestException: If process trigger fails
         """
@@ -317,7 +329,7 @@ class AnaplanAPI:
         url = f"{self.base_url}/workspaces/{workspace_id}/models/{model_id}/processes/{process_id}/tasks"
         payload = {"localeName": locale_name}
         try:
-            response = self.session.post(url, headers=self.headers, json=payload, timeout=60)
+            response = self.session.post(url, headers=self.headers, json=payload, timeout=10)
             response.raise_for_status()
             data = response.json()
             if data.get("status", {}).get("message") != "Success":
@@ -357,12 +369,11 @@ class AnaplanAPI:
         
         for attempt in range(max_attempts):
             try:
-                response = self.session.get(url, headers=self.headers, timeout=60)
+                response = self.session.get(url, headers=self.headers, timeout=10)
                 response.raise_for_status()
                 data = response.json()
                 task_state = data["task"]["taskState"]
-                progress = data["task"]["progress"]
-                logger.info(f"Task {task_id} status: {task_state} progress: {progress}")
+                logger.info(f"Task {task_id} status: {task_state}")
                 if task_state in ["COMPLETE", "FAILED", "CANCELLED"]:
                     return {
                         "status": task_state,
